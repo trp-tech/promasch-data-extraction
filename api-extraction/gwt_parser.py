@@ -32,56 +32,69 @@ def _collapse_concat_arrays(t: str) -> str:
 
     When a GWT response is large, the serializer emits:
         [a, b, ...].concat([c, d, ...]).concat([e, f, ...])
+    or with multiple arguments:
+        [a, b, ...].concat([c, d, ...], [e, f, ...])
 
     json5 can't evaluate JS method calls, so we collapse all
-    ].concat([ boundaries into plain commas before parsing.
-    Each ].concat( must be balanced by a closing ), which we drop.
+    .concat() calls into a single flat array before parsing.
 
-    Strategy: scan left-to-right, track bracket depth so we only
-    remove the `)` that closes each .concat( call (depth == 1 after
-    entering the concat argument).
+    Strategy: iteratively find each ].concat( call, parse its
+    comma-separated [...] arguments (respecting bracket depth and
+    quoted strings), and splice the inner content back into the
+    surrounding array.
     """
-    if not _CONCAT_RE.search(t):
-        return t
-
-    result: list[str] = []
-    i = 0
-    n = len(t)
-    while i < n:
-        m = _CONCAT_RE.search(t, i)
+    while True:
+        m = _CONCAT_RE.search(t)
         if not m:
-            result.append(t[i:])
             break
-        # Append everything up to (not including) the ']' of ].concat(
-        result.append(t[i: m.start()])
-        # Replace ].concat( with a comma — merging the two arrays
-        result.append(',')
-        # Skip past the opening '[' of the concat argument
+
+        # m matches ].concat( — parse comma-separated [...] args until )
         j = m.end()
-        # j now points just after '(' — find and drop the matching ')'
-        # by tracking bracket depth inside the concat argument
-        depth = 1
-        while j < n and depth > 0:
-            ch = t[j]
-            if ch == '[':
-                depth += 1
-            elif ch == ']':
-                depth -= 1
-                if depth == 0:
-                    # This ']' closes the concat argument list.
-                    # Append contents without the outer '[' already replaced,
-                    # but we still need the ']' to close the merged array later.
-                    result.append(t[m.end(): j + 1])
+        n = len(t)
+        parts: list[str] = []
+
+        while j < n:
+            while j < n and t[j] in ' \t\n\r,':
+                j += 1
+            if j >= n:
+                break
+            if t[j] == ')':
+                j += 1
+                break
+            if t[j] == '[':
+                j += 1
+                start = j
+                depth = 1
+                in_sq = in_dq = False
+                while j < n and depth > 0:
+                    ch = t[j]
+                    if in_sq:
+                        if ch == "'":
+                            in_sq = False
+                    elif in_dq:
+                        if ch == '"':
+                            in_dq = False
+                    elif ch == "'":
+                        in_sq = True
+                    elif ch == '"':
+                        in_dq = True
+                    elif ch == '[':
+                        depth += 1
+                    elif ch == ']':
+                        depth -= 1
                     j += 1
-                    # Now skip the closing ')' of .concat(...)
-                    while j < n and t[j] in ' \t\n\r':
-                        j += 1
-                    if j < n and t[j] == ')':
-                        j += 1
-                    break
-            j += 1
-        i = j
-    return ''.join(result)
+                parts.append(t[start:j - 1])
+            else:
+                start = j
+                while j < n and t[j] not in ',)':
+                    j += 1
+                parts.append(t[start:j])
+
+        # Rebuild: drop the ] before .concat( and the trailing ),
+        # emit comma + unwrapped inner content + closing ]
+        t = t[:m.start()] + ',' + ','.join(parts) + ']' + t[j:]
+
+    return t
 
 
 def normalize_gwt_response(text: str) -> List[Any]:

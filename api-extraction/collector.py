@@ -149,6 +149,12 @@ def _build_parts_scroll_js(delta_y: int = 1800) -> str:
 """
 
 
+_PARTS_PER_RPC = 10          # estimated parts returned per GWT page
+_BASE_SCROLL_ROUNDS = 30     # minimum scroll rounds for any leaf
+_MAX_SCROLL_ROUNDS = 800     # hard cap (auto-exit via idle detection)
+_IDLE_ROUNDS_THRESHOLD = 8   # stop after this many consecutive rounds with no new RPC
+
+
 def is_leaf_by_name(name: str) -> bool:
     low = name.lower()
     has_categories = bool(re.search(r"\d+\s+categor", low))
@@ -161,16 +167,41 @@ def is_leaf_by_name(name: str) -> bool:
     return False
 
 
+def parse_expected_parts(name: str) -> int:
+    """Extract the advertised part count from a leaf category tile name."""
+    m = re.search(r"(\d+)\s+parts?", name, re.I)
+    return int(m.group(1)) if m else 0
+
+
+def adaptive_scroll_rounds(expected_parts: int, base: int = _BASE_SCROLL_ROUNDS) -> int:
+    """Return scroll rounds needed to load all pages for a category."""
+    if expected_parts <= 0:
+        return base
+    needed = max(base, expected_parts // _PARTS_PER_RPC + 10)
+    return min(needed, _MAX_SCROLL_ROUNDS)
+
+
 def walk_and_trigger_rpc(
     ctx,
     tree_sel: str,
     max_folders: int,
     scroll_rounds: int,
     seq: Dict[str, Any],
+    folder_start: int = 0,
+    folder_limit: int = 0,
 ) -> None:
-    """Click folder tiles (same as UI extractor) and scroll in leaf folders to trigger getPartDetails."""
+    """Click folder tiles and scroll in leaf folders to trigger getPartDetails RPCs.
+
+    Args:
+        folder_start: Skip the first N leaf categories (0 = start from beginning).
+        folder_limit: Stop after processing this many leaf categories (0 = no limit).
+        scroll_rounds: Base scroll rounds; overridden per-category by adaptive logic.
+    """
     visited: set = set()
     i = 0
+    leaf_count = 0          # counts only leaf categories processed
+    under_extracted = []    # categories where we likely missed pages
+
     while i < max_folders:
         live_count = ctx.locator(tree_sel).count()
         if i >= live_count:
@@ -192,13 +223,21 @@ def walk_and_trigger_rpc(
 
         is_leaf = is_leaf_by_name(name)
         label = "LEAF" if is_leaf else "FOLDER"
-        print(f"\n[{i}/{live_count}+] [{label}] {name}")
 
         if not is_leaf:
             seq["current_folder"] = name
             seq["current_category"] = ""
+            print(f"\n[node {i}/{live_count}+] [{label}] {name}")
         else:
             seq["current_category"] = name
+
+            # Batch mode: skip leaves before folder_start
+            if leaf_count < folder_start:
+                leaf_count += 1
+                print(f"\n[node {i}/{live_count}+] [SKIP leaf {leaf_count}/{folder_start}] {name}")
+                continue
+
+            print(f"\n[node {i}/{live_count}+] [LEAF #{leaf_count + 1}] {name}")
 
         try:
             folder.click(timeout=8000)
@@ -215,28 +254,37 @@ def walk_and_trigger_rpc(
         if not is_leaf:
             continue
 
-        # Scroll the parts panel (right side) to trigger pagination RPCs.
-        # mouse.wheel(0, 0) scrolls the folder tree (top-left), so we must
-        # target the parts container explicitly.
+        leaf_count += 1
+
+        # ── Scroll the parts panel to trigger pagination RPCs ─────────────────
+        # mouse.wheel(0, 0) scrolls the folder tree — use JS to target the right panel.
         scroll_js = _build_parts_scroll_js()
         scrolled_via_js = False
-        if scroll_js:
-            try:
-                ctx.evaluate(scroll_js)
-                scrolled_via_js = True
-            except Exception:
-                pass
+        matched_sel = None
+        try:
+            matched_sel = ctx.evaluate(scroll_js)
+            scrolled_via_js = True
+            print(f"  [scroll] panel: {matched_sel or 'none found — fallback'}")
+        except Exception:
+            pass
 
-        if not scrolled_via_js:
-            # Fallback: hover over the right half of the viewport before scrolling
+        if not scrolled_via_js or not matched_sel:
             ctx.mouse.move(900, 450)
+            print("  [scroll] panel: mouse fallback (900, 450)")
+
+        # ── Adaptive rounds based on expected part count ───────────────────────
+        expected = parse_expected_parts(name)
+        rounds = adaptive_scroll_rounds(expected, base=scroll_rounds)
+        if expected > 0:
+            print(f"  [scroll] expected {expected} parts → {rounds} scroll rounds")
 
         prev_rpc_count = seq["n"]
         idle_rounds = 0
         last_rpc_at_round = seq["n"]
-        for _ in range(scroll_rounds):
-            ctx.wait_for_timeout(500)
-            if scrolled_via_js:
+
+        for _ in range(rounds):
+            ctx.wait_for_timeout(1200)
+            if scrolled_via_js and matched_sel:
                 try:
                     ctx.evaluate(scroll_js)
                 except Exception:
@@ -244,16 +292,45 @@ def walk_and_trigger_rpc(
                     ctx.mouse.wheel(0, 1800)
             else:
                 ctx.mouse.wheel(0, 1800)
-            # Stop early if no new RPCs have fired for 3 consecutive rounds
+
             if seq["n"] == last_rpc_at_round:
                 idle_rounds += 1
-                if idle_rounds >= 3:
+                if idle_rounds >= _IDLE_ROUNDS_THRESHOLD:
                     break
             else:
                 idle_rounds = 0
                 last_rpc_at_round = seq["n"]
+
         new_rpcs = seq["n"] - prev_rpc_count
-        print(f"  [scroll] triggered {new_rpcs} additional RPC(s)")
+        estimated_parts = new_rpcs * _PARTS_PER_RPC
+        print(f"  [scroll] {new_rpcs} RPC(s) → ~{estimated_parts} parts")
+
+        # ── Verify coverage ────────────────────────────────────────────────────
+        if expected > 0 and estimated_parts < expected * 0.5:
+            msg = (
+                f"  [WARNING] Under-extracted: ~{estimated_parts} of {expected} "
+                f"expected parts ({new_rpcs} RPCs). Scroll may not be reaching panel."
+            )
+            print(msg)
+            under_extracted.append({
+                "category": name,
+                "expected": expected,
+                "rpcs_fired": new_rpcs,
+                "estimated_parts": estimated_parts,
+            })
+
+        # ── Batch limit check ──────────────────────────────────────────────────
+        if folder_limit > 0 and leaf_count >= folder_start + folder_limit:
+            print(f"\n[collector] Batch limit reached ({folder_limit} leaves). Stopping.")
+            break
+
+    # ── End-of-run summary ─────────────────────────────────────────────────────
+    print(f"\n[collector] Traversal complete. Leaves processed: {leaf_count}")
+    if under_extracted:
+        print(f"[collector] ⚠  {len(under_extracted)} categories likely under-extracted:")
+        for u in under_extracted:
+            print(f"  • {u['category'][:70]}")
+            print(f"    expected={u['expected']}  rpcs={u['rpcs_fired']}  ~parts={u['estimated_parts']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,7 +341,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--headful", action="store_true")
     p.add_argument("--output-dir", type=Path, default=None, help="Defaults to api-extraction/data/<run_id>")
     p.add_argument("--max-folders", type=int, default=5000)
-    p.add_argument("--scroll-rounds", type=int, default=15, help="Scroll rounds per leaf folder")
+    p.add_argument("--scroll-rounds", type=int, default=15, help="Base scroll rounds (adaptive per category)")
+    p.add_argument("--folder-start", type=int, default=0, help="Skip first N leaf categories")
+    p.add_argument("--folder-limit", type=int, default=0, help="Process at most N leaf categories (0=all)")
     p.add_argument("--sel-tree", default=None)
     return p.parse_args()
 
@@ -286,6 +365,8 @@ def run_collection(
     max_folders: int,
     scroll_rounds: int,
     tree_sel_override: Optional[str],
+    folder_start: int = 0,
+    folder_limit: int = 0,
 ) -> List[Dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     payloads_dir = output_dir / "payloads"
@@ -354,7 +435,11 @@ def run_collection(
             )
         else:
             print(f"[collector] Using tree selector: {tree_sel}")
-            walk_and_trigger_rpc(ctx, tree_sel, max_folders, scroll_rounds, seq)
+            walk_and_trigger_rpc(
+                ctx, tree_sel, max_folders, scroll_rounds, seq,
+                folder_start=folder_start,
+                folder_limit=folder_limit,
+            )
 
         auth_path = output_dir / "auth_state.json"
         context.storage_state(path=str(auth_path))
@@ -382,6 +467,8 @@ def main() -> None:
         max_folders=args.max_folders,
         scroll_rounds=args.scroll_rounds,
         tree_sel_override=args.sel_tree,
+        folder_start=args.folder_start,
+        folder_limit=args.folder_limit,
     )
 
 

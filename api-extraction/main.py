@@ -148,7 +148,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--password", default=__import__("os").getenv("CONSTRUCTIONARY_PASSWORD", "Infosys@9009"))
     p.add_argument("--headful", action="store_true")
     p.add_argument("--max-folders", type=int, default=5000)
-    p.add_argument("--scroll-rounds", type=int, default=15)
+    p.add_argument("--scroll-rounds", type=int, default=15, help="Base scroll rounds (adaptive per category)")
+    p.add_argument("--folder-start", type=int, default=0, help="Skip first N leaf categories")
+    p.add_argument("--folder-limit", type=int, default=0, help="Process at most N leaf categories (0=all)")
     p.add_argument("--sel-tree", default=None)
     return p.parse_args()
 
@@ -187,6 +189,8 @@ def main() -> None:
             max_folders=args.max_folders,
             scroll_rounds=args.scroll_rounds,
             tree_sel_override=args.sel_tree,
+            folder_start=args.folder_start,
+            folder_limit=args.folder_limit,
         )
 
     if run_replay:

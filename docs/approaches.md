@@ -176,6 +176,54 @@ Raw text  →  normalize_gwt_response()  →  Python list
 uv run python api-extraction/collector.py --headful
 ```
 
+### Orchestrated pipeline (`main.py`)
+
+The full extraction is run via `main.py --all`, which chains:
+
+```
+collect → replay → parse → aggregate
+```
+
+- **collect**: Playwright opens the site, walks the folder tree, clicks each leaf category. Each click triggers a `getPartDetails` GWT-RPC call that returns **all parts for that category in one response** (no scroll-based pagination). Raw request payloads and response bodies are saved to `payloads/` and `dumps/`.
+- **replay**: Re-sends each captured payload to the server (useful for refreshing data without a browser).
+- **parse**: Runs `gwt_parser.py` on each dump file → individual parsed JSON.
+- **aggregate**: Merges all parsed files into a single `output.json`.
+
+```bash
+uv run python main.py --all --headful --folder-limit 20
+```
+
+### Bug fix: `.concat()` collapse (Apr 2025)
+
+**Symptom**: Only 433 of ~2,258 parts were extracted. 6 of 20 dump files failed to parse with `Unexpected end of input` errors. The collector's scroll-based "under-extraction" warnings were a **red herring** — each click already returns all parts in one RPC (no pagination).
+
+**Root cause**: The `_collapse_concat_arrays` function in `gwt_parser.py` silently dropped 70–93% of the data from large GWT responses.
+
+When a GWT response exceeds ~96 KB, the serializer splits it using JavaScript `.concat()`:
+
+```js
+[a, b, ...].concat([c, d, ...], [e, f, ...])
+```
+
+The old implementation used `[`/`]` bracket-depth tracking starting at `depth = 1`. Since the concat argument is always a balanced `[...data...]`, depth went `1 → 2 → ... → 1` and **never reached 0**. The inner while-loop ran to end-of-string, and the `if depth == 0` branch (which appends the concat content) was never executed. Everything after `.concat(` was silently discarded.
+
+**Fix**: Replaced with an iterative parser that:
+
+1. Matches each `].concat(` boundary
+2. Parses the comma-separated `[...]` arguments inside the `()`, tracking bracket depth **and** quoted strings (to avoid miscounting `[`/`]` inside string literals)
+3. Unwraps each argument (strips outer `[` and `]`) and splices the inner content back into the surrounding array
+4. Appends a closing `]` to keep the overall array structure valid
+5. Repeats until no `.concat(` calls remain (handles chained `.concat().concat()` too)
+
+**Result**: All 20 dump files now parse successfully. Parts extracted: **433 → 2,258** (5.2× increase). The 4 largest categories now match their expected counts exactly:
+
+| Category | Expected | Before fix | After fix |
+|---|---|---|---|
+| Cassette AC Unit (VRV/VRF) | 174 | 0 | 174 |
+| AC Outdoor Unit (VRV/VRF) | 200 | 0 | 200 |
+| Cassette AC Unit (DX) | 164 | 0 | 164 |
+| High Wall AC Unit (DX) | 283 | 0 | 283 |
+
 ### Known limitations
 
 - `price_market` can be inflated (GWT stream includes cumulative purchase amounts, hard to isolate exact market price)
@@ -183,6 +231,75 @@ uv run python api-extraction/collector.py --headful
 - `category_path` not populated yet (needs folder context from tree walker)
 - Vendor location is city/state only — not full address
 - Some `created_by` values are company names mis-detected as person names
+- Collector scroll warnings ("Under-extracted") are misleading — the app loads all parts per category in the initial click RPC, not via scroll-triggered pagination
+
+### Batch extraction + gap-fill (Apr 2025)
+
+**Problem**: Full extraction across all 1,172 categories yielded ~36,447 of 61,786 total parts (59% coverage).
+
+**Root cause analysis** (3 sources of loss):
+
+| Source | Missing parts | Explanation |
+|---|---|---|
+| Under-extracted categories (246 of 1,038 captured) | ~15,390 | Scroll idle-detection (`_IDLE_ROUNDS_THRESHOLD=3`) stopped scrolling before all paginated RPCs fired. Categories with hundreds of parts need many scroll rounds, but 3 idle rounds × 500ms was too conservative. |
+| `batch_901_1000` complete failure | ~2,000–3,000 | Session/login failure during that run — `payload_catalog.json` was empty (`[]`). |
+| Batches past leaf 1172 | 0 | Correctly empty — the tree has 1,172 leaf categories total (visible in the UI header as "1172 Categories"). `--folder-start ≥ 1172` skips past all leaves. |
+
+**Key discovery**: pagination is **entity-ID based**, not offset-based. Each `getPartDetails` RPC takes a different `entity_id` parameter (e.g. `178`, `176`, `309`), and each returns a different batch of parts. Scrolling in the UI triggers lazy-load requests with new entity IDs. There is no page offset — you cannot fabricate missing pages without the browser triggering them.
+
+#### Fix 1: Tuned collector parameters
+
+| Parameter | Before | After | Rationale |
+|---|---|---|---|
+| `_BASE_SCROLL_ROUNDS` | 15 | 30 | More scrolling per category by default |
+| `_MAX_SCROLL_ROUNDS` | 500 | 800 | Higher cap for large categories (3000+ parts) |
+| `_IDLE_ROUNDS_THRESHOLD` | 3 | 8 | Wait 8 rounds with no new RPC before stopping |
+| Scroll wait (`ctx.wait_for_timeout`) | 500ms | 1200ms | Give server more time to respond between scrolls |
+
+Re-run failed batch with tuned params:
+
+```bash
+python main.py --collect --all \
+  --data-dir data/batch_901_1000_v2 \
+  --folder-start 900 --folder-limit 100 --headful
+```
+
+#### Fix 2: Gap-fill collector (`gap_fill.py`)
+
+**File:** `api-extraction/gap_fill.py`
+
+Instead of re-running all 1,172 categories, the gap-fill collector:
+
+1. **Analyses** existing batch data — compares parsed part counts against expected counts (from category labels like "617 Parts"), flags categories below 70% coverage
+2. **Navigates directly** to each under-extracted category via the Constructionary search box — no full tree walk needed
+3. **Scrolls aggressively** (10 idle rounds, 1500ms wait, up to 800 rounds) to capture all pagination RPCs
+4. **Merges** gap-fill results with existing data, deduplicating by part ID
+
+```
+analyse → gap_manifest.json (125 categories, ~15k missing parts)
+       → collect (search-box navigation per category)
+       → merge + deduplicate → constructionary_merged.json
+```
+
+**Usage:**
+
+```bash
+# Analyse only (dry-run + writes manifest):
+python gap_fill.py --analyse --batches-dir data
+
+# Collect gap categories:
+python gap_fill.py --collect --batches-dir data --output-dir data/gap_fill --headful
+
+# Merge everything (existing batches + gap-fill → deduplicated output):
+python gap_fill.py --merge --batches-dir data --gap-dir data/gap_fill --final-dir data/final
+
+# All three in one shot:
+python gap_fill.py --all --batches-dir data --headful
+```
+
+**Search-box navigation** extracts the meaningful prefix from the category name (e.g. "GI Flange (Circ)" from "GI Flange (Circ) (Nos) 3186 Parts 20 Specifications"), types it into the search input, and clicks the matching result tile. This avoids walking 1,172 categories to reach the ~125 that need more data.
+
+**Deduplication** uses `part.id` (the `Brand(Model).ID` display name) as the unique key. Parts from gap-fill override existing entries only when new; duplicates are dropped.
 
 ---
 
