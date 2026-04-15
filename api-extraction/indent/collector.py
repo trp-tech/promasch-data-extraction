@@ -303,16 +303,17 @@ def navigate_to_indent_completed(page: Page) -> bool:
                 f"[collector] COMPLETED clicked via JS: {result.get('text', '')} "
                 f"(strategy={result.get('strategy', '')})"
             )
-            return True
+            if _ensure_indent_completed_list(page):
+                return True
         print(f"[collector] JS navigation: {result.get('error', 'unknown')}")
     except Exception as e:
         print(f"[collector] JS navigation failed: {e}")
 
-    # Strategy B: Playwright text locators (fallback)
+    # Strategy B: explicitly click INDENTS → COMPLETED in the left section card.
     for sel in [
-        "text=/COMPLETED\\s*[|·:]\\s*\\d+/ >> nth=0",
-        "text=COMPLETED >> nth=0",
-        "a:has-text('COMPLETED')",
+        "div:has-text('INDENTS') >> text=/COMPLETED\\s*\\|\\s*\\d+/",
+        "div:has-text('INDENTS') >> text=COMPLETED",
+        "text=INDENTS >> xpath=ancestor::*[1] >> text=COMPLETED",
     ]:
         try:
             loc = page.locator(sel).first
@@ -321,9 +322,14 @@ def navigate_to_indent_completed(page: Page) -> bool:
                 page.wait_for_load_state("networkidle", timeout=30_000)
                 page.wait_for_timeout(3000)
                 print(f"[collector] COMPLETED clicked via fallback: {sel!r}")
-                return True
+                if _ensure_indent_completed_list(page):
+                    return True
         except Exception:
             continue
+
+    # Strategy C: If section click worked but list did not switch, force filters.
+    if _force_indent_completed_filters(page):
+        return True
 
     print(
         "[collector] WARNING: Could not click COMPLETED under INDENTS. "
@@ -333,6 +339,67 @@ def navigate_to_indent_completed(page: Page) -> bool:
 
 
 # ── Scroll & click helpers for indent list ────────────────────────────────────
+
+def _ensure_indent_completed_list(page: Page) -> bool:
+    """Verify list view has Indents + Completed filters selected."""
+    checks = [
+        "text=/INDENT NO\\./i",
+        "text=Search Indent Number here",
+        "text=Completed",
+    ]
+    for _ in range(10):
+        for sel in checks:
+            try:
+                if page.locator(sel).first.count() > 0:
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(500)
+    return False
+
+
+def _force_indent_completed_filters(page: Page) -> bool:
+    """Set top filter dropdowns to Indents + Completed (UI-only fallback)."""
+    try:
+        for sel in [
+            "select:near(:text('Search Indent Number here')) >> nth=0",
+            "select >> nth=0",
+        ]:
+            dd = page.locator(sel).first
+            if dd.count() == 0:
+                continue
+            try:
+                dd.select_option(label="Indents", timeout=3000)
+                break
+            except Exception:
+                try:
+                    dd.select_option(value="Indents", timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+        for sel in [
+            "select:near(:text('Search Indent Number here')) >> nth=1",
+            "select >> nth=1",
+        ]:
+            dd = page.locator(sel).first
+            if dd.count() == 0:
+                continue
+            try:
+                dd.select_option(label="Completed", timeout=3000)
+                break
+            except Exception:
+                try:
+                    dd.select_option(value="Completed", timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        page.wait_for_timeout(2000)
+    except Exception:
+        return False
+    return _ensure_indent_completed_list(page)
 
 def _build_list_scroll_js(delta_y: int = 800) -> str:
     """Return JS that scrolls the widest scrollable container by delta_y px."""
@@ -479,18 +546,18 @@ def _click_indent_rows(
 
     Returns the number of detail responses captured.
     """
-    candidates = [
-        "text=/J-[A-Z0-9]{1,6}-[A-Z0-9]{1,6}-Ind-\\d+/",
-        "text=/\\bInd-\\d+\\b/",
-        "text=/J-.*-Ind-\\d+/",
+    card_candidates = [
+        "div:has-text('INDENT NO.')",
+        "div:has-text('Indent No.')",
+        "div:has-text('INDENT STATUS')",
     ]
-    indent_locs = None
+    row_cards = None
     count = 0
-    for sel in candidates:
+    for sel in card_candidates:
         loc = page.locator(sel)
         c = loc.count()
         if c > count:
-            indent_locs = loc
+            row_cards = loc
             count = c
 
     if count == 0:
@@ -503,9 +570,20 @@ def _click_indent_rows(
     for i in range(min(count, max_clicks)):
         prev_n = seq.get("detail_n", seq["n"])
         try:
-            loc = indent_locs.nth(i)
-            loc.scroll_into_view_if_needed(timeout=3000)
-            loc.click(timeout=5000)
+            card = row_cards.nth(i)
+            card.scroll_into_view_if_needed(timeout=5000)
+            clicked = False
+            for sub_sel in [
+                "text=/J-[A-Z0-9-]+-Ind-\\d+(?:[/-]\\d+)?/",
+                "text=/\\bInd-\\d+\\b/",
+            ]:
+                sub = card.locator(sub_sel).first
+                if sub.count() > 0:
+                    sub.click(timeout=5000)
+                    clicked = True
+                    break
+            if not clicked:
+                card.click(timeout=5000)
         except Exception as e:
             print(f"  [click] indent {i + 1}: click failed: {e}")
             continue
@@ -516,6 +594,12 @@ def _click_indent_rows(
             if seq.get("detail_n", seq["n"]) > prev_n:
                 captured = True
                 break
+            try:
+                if page.locator("text=/Indent\\s*\\(Completed\\)/i").first.count() > 0:
+                    captured = True
+                    break
+            except Exception:
+                pass
 
         if captured:
             detail_captured += 1
