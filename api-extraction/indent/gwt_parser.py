@@ -235,7 +235,7 @@ _PO_RE = re.compile(r'^(?:PO|B\(PO)\(')
 _DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}')
 
 # J-indent reference pattern: J-XX-XX-Ind-NN-date-seq
-_JINDENT_RE = re.compile(r'^J-[A-Z]{2}-[A-Z]{2}-Ind-\d+-')
+_JINDENT_RE = re.compile(r'^J-[A-Z0-9]{1,6}-[A-Z0-9]{1,6}-Ind-\d+(?:-|$)')
 
 
 def _is_vendor(s: str) -> bool:
@@ -520,6 +520,42 @@ def parse_detail_dump_text(text: str) -> Dict[str, Any]:
 
     if not anchors:
         warnings.append("no_circuit_info_anchors_found")
+        seen_circuits: set[str] = set()
+        for s in st:
+            if not _is_circuit_info(s) or s in seen_circuits:
+                continue
+            seen_circuits.add(s)
+            circuit = parse_circuit_info(s)
+            parts.append({
+                "circuit_system": circuit.get("circuit_system"),
+                "circuit_part_name": circuit.get("circuit_part_name"),
+                "supply_type": circuit.get("supply_type"),
+                "indent_qty": circuit.get("indent_qty"),
+                "approved_qty": circuit.get("approved_qty"),
+                "dispatched_qty": circuit.get("dispatched_qty"),
+                "remaining_qty": circuit.get("remaining_qty"),
+                "remarks": circuit.get("remarks"),
+                "indent_date": circuit.get("indent_date"),
+                "required_date": circuit.get("required_date"),
+                "part_category": None,
+                "part_category_alt": None,
+                "uom": None,
+                "vendor_name": None,
+                "vendor_location": None,
+                "po_references": [],
+                "progress_refs": [],
+                "j_indent_refs": [],
+                "status": None,
+                "images": [],
+                "person_names": [],
+                "dates": [],
+                "amount": None,
+                "gst_amount": None,
+                "total_amount": None,
+                "_circuit_raw": s,
+            })
+        if parts:
+            warnings.append("used_string_table_fallback_for_parts")
     else:
         n = len(anchors)
         for idx, (pos, circuit_raw) in enumerate(anchors):
@@ -599,10 +635,9 @@ def extract_indent_ids_from_list_response(text: str) -> List[int]:
     Extract Java Long indent IDs from a getIndentListCompleted GWT response.
 
     Strategy: in GWT-RPC responses, java.lang.Long values are serialised as
-    two consecutive 32-bit integers (high, low).  For typical indent IDs
-    (< 2^32) the high word is 0.  We look for the java.lang.Long type
-    descriptor in the string table, then scan for the pattern
-      [long_type_ref, 0, positive_int]
+    two consecutive 32-bit integers (high, low). We look for the java.lang.Long
+    type descriptor in the string table, then scan for the pattern
+      [long_type_ref, high, low]
     in the primitive stream.
     """
     data = normalize_gwt_response(text)
@@ -628,13 +663,15 @@ def extract_indent_ids_from_list_response(text: str) -> List[int]:
             high = primitives[i + 1]
             low = primitives[i + 2]
             if (
-                isinstance(high, int) and not isinstance(high, bool) and high == 0
+                isinstance(high, int) and not isinstance(high, bool)
                 and isinstance(low, int) and not isinstance(low, bool)
-                and 1 <= low < 10_000_000
-                and low not in seen
             ):
-                ids.append(low)
-                seen.add(low)
+                hi = high & 0xFFFFFFFF
+                lo = low & 0xFFFFFFFF
+                value = (hi << 32) | lo
+                if 1 <= value <= 9_999_999_999 and value not in seen:
+                    ids.append(value)
+                    seen.add(value)
     return ids
 
 

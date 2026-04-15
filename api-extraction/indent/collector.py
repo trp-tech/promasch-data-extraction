@@ -170,6 +170,8 @@ _PURCHASE_SIDEBAR_SELECTORS = [
     "a:has-text('Purchase | Work Order')",
     "text=Purchase | Work Order | Challans | Vendor Bills",
     "a:has-text('Purchase')",
+    "div:has-text('Purchase | Work Order | Challans | Vendor Bills')",
+    "span:has-text('Purchase | Work Order | Challans | Vendor Bills')",
 ]
 
 # JS to find the INDENTS section heading and click COMPLETED within it.
@@ -178,74 +180,83 @@ _PURCHASE_SIDEBAR_SELECTORS = [
 # that belong to the ORDERS/PO/WO sections.
 _INDENT_COMPLETED_JS = """
 (function() {
+    function ownText(el) {
+        var t = '';
+        for (var i = 0; i < el.childNodes.length; i++) {
+            if (el.childNodes[i].nodeType === 3) t += el.childNodes[i].textContent;
+        }
+        return t.trim();
+    }
+
+    function isVisible(el) {
+        return !!(el && el.offsetParent !== null);
+    }
+
     var allEls = document.querySelectorAll('*');
     var indentHeader = null;
 
     for (var i = 0; i < allEls.length; i++) {
         var el = allEls[i];
-        var ownText = '';
-        for (var j = 0; j < el.childNodes.length; j++) {
-            if (el.childNodes[j].nodeType === 3) {
-                ownText += el.childNodes[j].textContent;
-            }
-        }
-        if (ownText.trim().toUpperCase() === 'INDENTS') {
+        var txt = ownText(el).toUpperCase();
+        if (txt === 'INDENTS') {
             indentHeader = el;
             break;
         }
     }
 
-    if (!indentHeader) {
-        for (var i = 0; i < allEls.length; i++) {
-            if (allEls[i].children.length <= 2 &&
-                allEls[i].textContent.trim().toUpperCase() === 'INDENTS') {
-                indentHeader = allEls[i];
-                break;
-            }
+    if (!indentHeader) return JSON.stringify({ok: false, error: 'INDENTS_NOT_FOUND'});
+
+    // Find nearest "card-like" container that contains INDENTS heading.
+    var card = indentHeader;
+    for (var depth = 0; depth < 8 && card; depth++) {
+        var t = card.textContent ? card.textContent.toUpperCase() : '';
+        if (t.indexOf('INDENTS') >= 0 && t.indexOf('IN-PROCESS') >= 0 && t.indexOf('COMPLETED') >= 0) {
+            break;
+        }
+        card = card.parentElement;
+    }
+
+    if (!card) return JSON.stringify({ok: false, error: 'INDENTS_CARD_NOT_FOUND'});
+
+    // Click COMPLETED only inside INDENTS card.
+    var candidates = card.querySelectorAll('a,button,div,span,td,li');
+    for (var m = 0; m < candidates.length; m++) {
+        var node = candidates[m];
+        if (!isVisible(node)) continue;
+        var txtNode = (node.textContent || '').trim();
+        if (/^COMPLETED(\\s*[|:·]\\s*\\d+)?$/i.test(txtNode) || /^COMPLETED\\s*\\|/i.test(txtNode)) {
+            node.click();
+            return JSON.stringify({ok: true, text: txtNode, strategy: 'indent_card_completed'});
         }
     }
 
-    if (!indentHeader) {
-        return JSON.stringify({ok: false, error: 'INDENTS_NOT_FOUND'});
+    // Fallback: exact text search for completed count inside card.
+    var cardText = (card.textContent || '');
+    if (/COMPLETED\\s*\\|\\s*\\d+/i.test(cardText)) {
+        var fallback = Array.from(candidates).find(function(n) {
+            return isVisible(n) && /COMPLETED\\s*\\|\\s*\\d+/i.test((n.textContent || '').trim());
+        });
+        if (fallback) {
+            fallback.click();
+            return JSON.stringify({ok: true, text: fallback.textContent.trim(), strategy: 'indent_card_completed_count'});
+        }
     }
 
-    var container = indentHeader;
-    for (var depth = 0; depth < 8; depth++) {
-        container = container.parentElement;
-        if (!container) break;
-
-        var links = container.querySelectorAll('a, div, span, td, li');
-        for (var m = 0; m < links.length; m++) {
-            var link = links[m];
-            var txt = link.textContent.trim();
-
-            if (!/COMPLETED/i.test(txt) || link.offsetParent === null || link === indentHeader)
-                continue;
-
-            var isInOrders = false;
-            var parent = link.parentElement;
-            for (var p = 0; p < 3 && parent && parent !== container; p++) {
-                var pText = '';
-                for (var q = 0; q < parent.childNodes.length; q++) {
-                    if (parent.childNodes[q].nodeType === 3)
-                        pText += parent.childNodes[q].textContent;
-                }
-                pText = pText.trim().toUpperCase();
-                if (pText === 'ORDERS' || pText === 'PO' || pText === 'WO') {
-                    isInOrders = true;
-                    break;
-                }
-                parent = parent.parentElement;
-            }
-
-            if (!isInOrders) {
+    // Last resort: nearest visible completed element around INDENTS header.
+    var root = indentHeader.parentElement || document.body;
+    for (var climb = 0; climb < 4 && root; climb++) {
+        var nearby = root.querySelectorAll('a,button,div,span,td,li');
+        for (var n = 0; n < nearby.length; n++) {
+            var link = nearby[n];
+            var txt2 = (link.textContent || '').trim();
+            if (isVisible(link) && /^COMPLETED/i.test(txt2)) {
                 link.click();
-                return JSON.stringify({ok: true, text: txt, strategy: 'section_walk'});
+                return JSON.stringify({ok: true, text: txt2, strategy: 'nearest_completed'});
             }
         }
+        root = root.parentElement;
     }
-
-    return JSON.stringify({ok: false, error: 'COMPLETED_NOT_FOUND_NEAR_INDENTS'});
+    return JSON.stringify({ok: false, error: 'COMPLETED_NOT_FOUND_IN_INDENTS'});
 })()
 """
 
@@ -292,16 +303,17 @@ def navigate_to_indent_completed(page: Page) -> bool:
                 f"[collector] COMPLETED clicked via JS: {result.get('text', '')} "
                 f"(strategy={result.get('strategy', '')})"
             )
-            return True
+            if _ensure_indent_completed_list(page):
+                return True
         print(f"[collector] JS navigation: {result.get('error', 'unknown')}")
     except Exception as e:
         print(f"[collector] JS navigation failed: {e}")
 
-    # Strategy B: Playwright text locators (fallback)
+    # Strategy B: explicitly click INDENTS → COMPLETED in the left section card.
     for sel in [
-        "text=/COMPLETED\\s*[|·:]\\s*\\d+/ >> nth=0",
-        "text=COMPLETED >> nth=0",
-        "a:has-text('COMPLETED')",
+        "div:has-text('INDENTS') >> text=/COMPLETED\\s*\\|\\s*\\d+/",
+        "div:has-text('INDENTS') >> text=COMPLETED",
+        "text=INDENTS >> xpath=ancestor::*[1] >> text=COMPLETED",
     ]:
         try:
             loc = page.locator(sel).first
@@ -310,9 +322,14 @@ def navigate_to_indent_completed(page: Page) -> bool:
                 page.wait_for_load_state("networkidle", timeout=30_000)
                 page.wait_for_timeout(3000)
                 print(f"[collector] COMPLETED clicked via fallback: {sel!r}")
-                return True
+                if _ensure_indent_completed_list(page):
+                    return True
         except Exception:
             continue
+
+    # Strategy C: If section click worked but list did not switch, force filters.
+    if _force_indent_completed_filters(page):
+        return True
 
     print(
         "[collector] WARNING: Could not click COMPLETED under INDENTS. "
@@ -322,6 +339,67 @@ def navigate_to_indent_completed(page: Page) -> bool:
 
 
 # ── Scroll & click helpers for indent list ────────────────────────────────────
+
+def _ensure_indent_completed_list(page: Page) -> bool:
+    """Verify list view has Indents + Completed filters selected."""
+    checks = [
+        "text=/INDENT NO\\./i",
+        "text=Search Indent Number here",
+        "text=Completed",
+    ]
+    for _ in range(10):
+        for sel in checks:
+            try:
+                if page.locator(sel).first.count() > 0:
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(500)
+    return False
+
+
+def _force_indent_completed_filters(page: Page) -> bool:
+    """Set top filter dropdowns to Indents + Completed (UI-only fallback)."""
+    try:
+        for sel in [
+            "select:near(:text('Search Indent Number here')) >> nth=0",
+            "select >> nth=0",
+        ]:
+            dd = page.locator(sel).first
+            if dd.count() == 0:
+                continue
+            try:
+                dd.select_option(label="Indents", timeout=3000)
+                break
+            except Exception:
+                try:
+                    dd.select_option(value="Indents", timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+        for sel in [
+            "select:near(:text('Search Indent Number here')) >> nth=1",
+            "select >> nth=1",
+        ]:
+            dd = page.locator(sel).first
+            if dd.count() == 0:
+                continue
+            try:
+                dd.select_option(label="Completed", timeout=3000)
+                break
+            except Exception:
+                try:
+                    dd.select_option(value="Completed", timeout=3000)
+                    break
+                except Exception:
+                    continue
+
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        page.wait_for_timeout(2000)
+    except Exception:
+        return False
+    return _ensure_indent_completed_list(page)
 
 def _build_list_scroll_js(delta_y: int = 800) -> str:
     """Return JS that scrolls the widest scrollable container by delta_y px."""
@@ -359,6 +437,23 @@ def _scroll_indent_list(
     Returns the number of new RPC calls triggered by scrolling.
     """
     scroll_js = _build_list_scroll_js(scroll_delta)
+    scroll_all_js = f"""
+    (function() {{
+        var divs = Array.from(document.querySelectorAll('div'));
+        var count = 0;
+        divs.forEach(function(d) {{
+            if (d.scrollHeight > d.clientHeight + 50) {{
+                var rect = d.getBoundingClientRect();
+                if (rect.width >= 250 && rect.height >= 120 && rect.left >= 120) {{
+                    d.scrollBy(0, {scroll_delta});
+                    count++;
+                }}
+            }}
+        }});
+        if (count === 0) window.scrollBy(0, {scroll_delta});
+        return count;
+    }})()
+    """
     prev_n = seq["n"]
     idle_count = 0
     last_rpc_n = seq["n"]
@@ -368,6 +463,10 @@ def _scroll_indent_list(
             panel = page.evaluate(scroll_js)
             if round_num == 0:
                 print(f"[collector] Scrolling list panel: {panel}")
+            if round_num % 3 == 2:
+                scrolled = page.evaluate(scroll_all_js)
+                if scrolled:
+                    print(f"[collector] Broad-scroll pass touched {scrolled} container(s)")
         except Exception:
             page.mouse.move(800, 450)
             page.mouse.wheel(0, scroll_delta)
@@ -447,8 +546,19 @@ def _click_indent_rows(
 
     Returns the number of detail responses captured.
     """
-    indent_locs = page.locator("text=/J-[A-Z]{2}-[A-Z]{2}-Ind-\\d+/")
-    count = indent_locs.count()
+    card_candidates = [
+        "div:has-text('INDENT NO.')",
+        "div:has-text('Indent No.')",
+        "div:has-text('INDENT STATUS')",
+    ]
+    row_cards = None
+    count = 0
+    for sel in card_candidates:
+        loc = page.locator(sel)
+        c = loc.count()
+        if c > count:
+            row_cards = loc
+            count = c
 
     if count == 0:
         print("[collector] No indent rows found to click")
@@ -458,11 +568,22 @@ def _click_indent_rows(
     detail_captured = 0
 
     for i in range(min(count, max_clicks)):
-        prev_n = seq["n"]
+        prev_n = seq.get("detail_n", seq["n"])
         try:
-            loc = indent_locs.nth(i)
-            loc.scroll_into_view_if_needed(timeout=3000)
-            loc.click(timeout=5000)
+            card = row_cards.nth(i)
+            card.scroll_into_view_if_needed(timeout=5000)
+            clicked = False
+            for sub_sel in [
+                "text=/J-[A-Z0-9-]+-Ind-\\d+(?:[/-]\\d+)?/",
+                "text=/\\bInd-\\d+\\b/",
+            ]:
+                sub = card.locator(sub_sel).first
+                if sub.count() > 0:
+                    sub.click(timeout=5000)
+                    clicked = True
+                    break
+            if not clicked:
+                card.click(timeout=5000)
         except Exception as e:
             print(f"  [click] indent {i + 1}: click failed: {e}")
             continue
@@ -470,9 +591,15 @@ def _click_indent_rows(
         captured = False
         for _ in range(detail_wait_seconds * 2):
             page.wait_for_timeout(500)
-            if seq["n"] > prev_n:
+            if seq.get("detail_n", seq["n"]) > prev_n:
                 captured = True
                 break
+            try:
+                if page.locator("text=/Indent\\s*\\(Completed\\)/i").first.count() > 0:
+                    captured = True
+                    break
+            except Exception:
+                pass
 
         if captured:
             detail_captured += 1
@@ -517,7 +644,7 @@ def run_collection(
         d.mkdir(parents=True, exist_ok=True)
 
     catalog: List[Dict[str, Any]] = []
-    seq = {"n": 0}
+    seq = {"n": 0, "detail_n": 0, "list_n": 0}
     captured_headers: Dict[str, Dict[str, str]] = {}
     captured_permutation2: Dict[str, str] = {"value": ""}
 
@@ -569,6 +696,10 @@ def run_collection(
             "indent_id": indent_id,
         }
         catalog.append(entry)
+        if is_detail:
+            seq["detail_n"] = seq.get("detail_n", 0) + 1
+        else:
+            seq["list_n"] = seq.get("list_n", 0) + 1
         tag = f" (indent={indent_id})" if indent_id else ""
         print(f"  [captured] {method_name} → {stem}.txt{tag}")
 
