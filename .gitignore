@@ -13,4 +13,9 @@ wheels/
 api-extraction/data/
 api-extraction/*/data/
 
-UI-extraction/data/ 
+UI-extraction/data/
+
+# Vendor bills run data
+vendor-bills/data/
+vendor-bills/.env
+vendor-bills/.env.example
