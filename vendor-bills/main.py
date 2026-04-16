@@ -237,18 +237,24 @@ def phase_download_and_upload(
     return all_s3_urls
 
 
-def phase_merge(s3_urls: dict[str, dict[int, str]] | None = None) -> list:
+def phase_merge(
+    s3_urls: dict[str, dict[int, str]] | None = None,
+    *,
+    id_ranges: dict[str, list[int]] | None = None,
+) -> list:
     """
     Merge metadata with S3 URLs into final output.
-    If s3_urls not provided, tries to reconstruct from existing final_output.
+
+    id_ranges — optional {otype: [list of bill IDs]}.  When provided, every ID
+    in the range gets a row in the output even if no scraped metadata exists for
+    it.  This covers the gap when --id-range was used at download time.
     """
     final_records = []
 
     for otype in ["PO", "WO"]:
         metadata_file = config.PO_METADATA_FILE if otype == "PO" else config.WO_METADATA_FILE
         metadata = load_json(metadata_file)
-        if not metadata:
-            continue
+        meta_by_id = {r["bill_id"]: r for r in metadata if r.get("bill_id")} if metadata else {}
 
         type_s3_urls = (s3_urls or {}).get(otype, {})
 
@@ -260,17 +266,28 @@ def phase_merge(s3_urls: dict[str, dict[int, str]] | None = None) -> list:
         }
         existing_url_map.update(type_s3_urls)
 
-        for record in metadata:
-            bill_id = record.get("bill_id")
-            if not bill_id:
-                continue
+        all_ids: set[int] = set(meta_by_id.keys())
+        if id_ranges and otype in id_ranges:
+            all_ids.update(id_ranges[otype])
 
-            meta_fields = {k: v for k, v in record.items() if k not in ("bill_id", "type")}
+        if not all_ids:
+            continue
+
+        for bill_id in sorted(all_ids):
+            record = meta_by_id.get(bill_id)
+            if record:
+                meta_fields = {k: v for k, v in record.items() if k not in ("bill_id", "type")}
+            else:
+                meta_fields = {}
+
+            s3_url = existing_url_map.get(bill_id, "")
+            if not s3_url and (id_ranges and otype in id_ranges):
+                s3_url = _s3_url_for(otype, bill_id)
 
             final_records.append({
                 "bill_id": bill_id,
                 "type": otype,
-                "s3_url": existing_url_map.get(bill_id, ""),
+                "s3_url": s3_url,
                 "metadata": meta_fields,
             })
 
@@ -278,8 +295,9 @@ def phase_merge(s3_urls: dict[str, dict[int, str]] | None = None) -> list:
     log.info("Final output: %d records saved to %s", len(final_records), config.FINAL_OUTPUT_FILE)
 
     with_s3 = sum(1 for r in final_records if r["s3_url"])
-    without_s3 = len(final_records) - with_s3
-    log.info("  With S3 URL: %d | Without: %d", with_s3, without_s3)
+    with_meta = sum(1 for r in final_records if r["metadata"])
+    without_meta = len(final_records) - with_meta
+    log.info("  With S3 URL: %d | With metadata: %d | S3-only (no metadata): %d", with_s3, with_meta, without_meta)
 
     return final_records
 
@@ -464,7 +482,10 @@ def main():
         log.info("-" * 40)
         log.info("PHASE 4: Merging metadata + S3 URLs")
         log.info("-" * 40)
-        phase_merge(s3_urls)
+        merge_id_ranges: dict[str, list[int]] | None = None
+        if bill_ids_override and args.type != "ALL":
+            merge_id_ranges = {args.type: bill_ids_override}
+        phase_merge(s3_urls, id_ranges=merge_id_ranges)
 
     summary.print_report(log)
 

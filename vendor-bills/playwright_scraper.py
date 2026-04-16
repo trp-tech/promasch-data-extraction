@@ -189,6 +189,8 @@ def _scroll_and_extract(
     else:
         log.info("No scrollable container found — falling back to mouse wheel")
 
+    js_stall_switch = 15  # switch to mouse wheel if JS scroll stalls this many rounds
+
     for round_num in range(max_scroll_rounds):
         ctx.wait_for_timeout(config.SCROLL_PAUSE_MS)
 
@@ -229,6 +231,13 @@ def _scroll_and_extract(
                     stable_rounds, len(all_records),
                 )
                 break
+            # Auto-switch from JS scroll to mouse wheel if stalled early
+            if use_js_scroll and stable_rounds == js_stall_switch:
+                log.info(
+                    "JS scroll stalled at %d records after %d idle rounds — switching to mouse wheel",
+                    len(all_records), stable_rounds,
+                )
+                use_js_scroll = False
         else:
             stable_rounds = 0
 
